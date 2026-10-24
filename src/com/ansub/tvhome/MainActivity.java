@@ -79,9 +79,13 @@ public class MainActivity extends Activity {
 
     // Settings shortcuts: name, label, icon. Tile keys are QUICK + name.
     private static final String QUICK = "quick:";
-    private static final String[] QUICK_NAMES = {"bluetooth", "sound", "picture"};
-    private static final String[] QUICK_LABELS = {"Bluetooth", "Sound", "Picture"};
-    private static final int[][] QUICK_ICONS = {LineIcon.BLUETOOTH, LineIcon.SOUND, LineIcon.PICTURE};
+    private static final String[] QUICK_NAMES = {"bluetooth", "sound", "picture", "restart"};
+    private static final String[] QUICK_LABELS = {"Bluetooth", "Sound", "Picture", "Restart"};
+    private static final int[][] QUICK_ICONS = {LineIcon.BLUETOOTH, LineIcon.SOUND, LineIcon.PICTURE, LineIcon.RESTART};
+    // The TV's Settings app listens for this broadcast and restarts the TV. Whether an ordinary app
+    // is allowed to send it depends on the TV, so Restart asks first and may do nothing.
+    private static final String TV_REBOOT_ACTION = "com.android.tv.settings.REBOOT_DEVICE";
+    private static final String TV_SETTINGS_PKG = "com.android.tv.settings";
     private static final String NETWORK = "network";
     private static final int OFFLINE = 0, ETHERNET = 4; // network states; 1 to 3 are Wi-Fi bars
     // TCL keeps its own Picture and Sound panels in a service; Android's Sound page is missing there.
@@ -229,6 +233,17 @@ public class MainActivity extends Activity {
         super.onNewIntent(intent);
         setIntent(intent);
         if (saveConfig(intent)) buildTiles();
+        // Pressing Home puts focus on the first HDMI input, so OK opens HDMI 1.
+        if (intent != null && intent.hasCategory(Intent.CATEGORY_HOME)) focusFirstInput();
+    }
+
+    // Focuses the first HDMI tile. False if there is none, so the caller keeps its own choice.
+    private boolean focusFirstInput() {
+        for (View t : tiles) {
+            Object tag = t.getTag();
+            if (tag instanceof String && isInput((String) tag)) return t.requestFocus();
+        }
+        return false;
     }
 
     // Saves an app list passed with --es apps "..." and shortcuts passed with --es quick "...".
@@ -290,7 +305,7 @@ public class MainActivity extends Activity {
         }
         refreshNetwork();
         View f = getCurrentFocus();
-        if (f == null && !tiles.isEmpty()) tiles.get(0).requestFocus();
+        if (f == null && !tiles.isEmpty() && !focusFirstInput()) tiles.get(0).requestFocus();
     }
 
     // Back from a menu or a window on top (like the uninstall prompt): catch up on apps that changed.
@@ -403,7 +418,9 @@ public class MainActivity extends Activity {
         int launchable = 0;
         for (String pkg : apps) if (launchIntent(pm, pkg) != null) launchable++;
         int rows = Math.max(1, (launchable + PER_ROW - 1) / PER_ROW);
-        gridTop = Math.max(px(GRID_MIN_TOP), px(ROW1_TOP) - (rows - 1) * px(ROW_STEP));
+        // The HDMI row now sits where the first app row was, and the apps start one row lower.
+        int hdmiTop = Math.max(px(GRID_MIN_TOP), px(ROW1_TOP) - (rows - 1) * px(ROW_STEP));
+        gridTop = hdmiTop + px(ROW_STEP);
         int bottomTop = gridTop + rows * px(ROW_STEP);
         ((FrameLayout.LayoutParams) moveHint.getLayoutParams()).topMargin = gridTop - px(64);
         root.setMinimumHeight(bottomTop + h + px(MARGIN));
@@ -430,12 +447,14 @@ public class MainActivity extends Activity {
         int col = 0;
         boolean store = !apps.contains(PLAY_STORE) && launchIntent(pm, PLAY_STORE) != null;
         List<TvInputInfo> inputs = hdmiInputs();
-        int room = PER_ROW - 2 - (store ? 1 : 0);
+        int room = PER_ROW;
         if (inputs.size() > room) inputs = inputs.subList(0, room);
+        // HDMI inputs: the first row, left to right.
+        int hcol = 0;
+        for (TvInputInfo in : inputs)
+            addTile(root, in.getId(), inputLabel(in), null, LineIcon.HDMI, null, m + hcol++ * (w + g), hdmiTop, w, h);
         if (store)
             addTile(root, PLAY_STORE, "Play Store", null, LineIcon.PLAY, null, m + col++ * (w + g), bottomTop, w, h);
-        for (TvInputInfo in : inputs)
-            addTile(root, in.getId(), inputLabel(in), null, LineIcon.HDMI, null, m + col++ * (w + g), bottomTop, w, h);
         addTile(root, SETTINGS, Strings.t("Settings"), null, LineIcon.SETTINGS, null, m + col++ * (w + g), bottomTop, w, h);
         addTile(root, ADD, Strings.t("Add app"), null, LineIcon.PLUS, null, m + col * (w + g), bottomTop, w, h);
 
@@ -657,7 +676,8 @@ public class MainActivity extends Activity {
         if (saved == null) return out;
         for (String name : saved.split("[,\\s]+")) {
             int q = Arrays.asList(QUICK_NAMES).indexOf(name.toLowerCase(java.util.Locale.ROOT));
-            if (q < 0 || out.contains(q) || quickIntents(QUICK_NAMES[q]).isEmpty()) continue;
+            if (q < 0 || out.contains(q)) continue;
+            if (!QUICK_NAMES[q].equals("restart") && quickIntents(QUICK_NAMES[q]).isEmpty()) continue;
             out.add(q);
         }
         return out;
@@ -745,6 +765,10 @@ public class MainActivity extends Activity {
 
     // Opens a shortcut's screen: the first one that starts wins. False if none did.
     private boolean openQuick(String name) {
+        if (name.equals("restart")) {
+            confirmRestart();
+            return true;
+        }
         for (Intent i : quickIntents(name)) {
             try {
                 if (TCL_SHOW_WINDOW.equals(i.getAction())) startService(i);
@@ -753,6 +777,22 @@ public class MainActivity extends Activity {
             } catch (Exception ignored) {}
         }
         return false;
+    }
+
+    // Asks first, with Cancel selected, then sends the trigger to the TV's Settings app.
+    private void confirmRestart() {
+        final android.app.AlertDialog d = new android.app.AlertDialog.Builder(this)
+                .setTitle("Restart the TV?")
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Restart", (dialog, which) -> {
+                    try {
+                        sendBroadcast(new Intent(TV_REBOOT_ACTION).setPackage(TV_SETTINGS_PKG));
+                    } catch (Exception ignored) {}
+                })
+                .create();
+        d.show();
+        android.widget.Button cancel = d.getButton(android.app.AlertDialog.BUTTON_NEGATIVE);
+        if (cancel != null) cancel.requestFocus();
     }
 
     // The TV's own picture screen, where brightness lives: the Picture shortcut's screens first (TCL's
