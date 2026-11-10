@@ -51,6 +51,10 @@ import android.widget.TextClock;
 import android.widget.TextView;
 
 import java.io.File;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -129,6 +133,11 @@ public class MainActivity extends Activity {
     // The Pictures wallpaper: the images in the launcher's own "wallpapers" folder, one every minute.
     private static final String PICTURES = "Pictures";
     private static final long SLIDE_MS = 60 * 1000;
+    // A new random photo each time, at the size asked for (Lorem Picsum, photos from Unsplash). If the
+    // download fails, the pictures in the folder are used, and then the gradient.
+    private static final boolean ONLINE = true;
+    private static final String PICTURE_URL = "https://picsum.photos/";
+    private static final long MAX_DOWNLOAD = 12L * 1024 * 1024;
     private final Handler slideTimer = new Handler(Looper.getMainLooper());
     private final Runnable slideTick = this::nextSlide;
     private boolean awake;      // Home is on screen
@@ -374,7 +383,7 @@ public class MainActivity extends Activity {
     private int wallpaper() {
         String saved = getSharedPreferences(PREFS, 0).getString("wallpaper", null);
         List<String> names = Arrays.asList(WALLPAPER_NAMES);
-        if (saved == null && pictureFiles().length > 0) return names.indexOf(PICTURES);
+        if (saved == null && (ONLINE || pictureFiles().length > 0)) return names.indexOf(PICTURES);
         return Math.max(0, names.indexOf(saved));
     }
 
@@ -404,14 +413,16 @@ public class MainActivity extends Activity {
         slideTimer.removeCallbacks(slideTick);
         if (!slides || !awake) return;
         final File[] files = pictureFiles();
-        if (files.length == 0) return;
-        slideAt = (slideAt + 1) % files.length;
-        final File file = files[slideAt];
+        if (!ONLINE && files.length == 0) return;
+        if (files.length > 0) slideAt = (slideAt + 1) % files.length;
+        final File file = files.length > 0 ? files[slideAt] : null;
         final int gen = ++slideGen;
         final int w = getResources().getDisplayMetrics().widthPixels;
         final int h = getResources().getDisplayMetrics().heightPixels;
         new Thread(() -> {
-            final Bitmap bmp = decodePicture(file, w, h);
+            Bitmap got = ONLINE ? downloadPicture(w, h) : null;
+            if (got == null && file != null) got = decodePicture(file, w, h);
+            final Bitmap bmp = got;
             runOnUiThread(() -> {
                 if (gen != slideGen || !slides || !awake) {
                     if (bmp != null) bmp.recycle();
@@ -426,6 +437,37 @@ public class MainActivity extends Activity {
                 slideTimer.postDelayed(slideTick, SLIDE_MS);
             });
         }, "tvhome-wallpaper").start();
+    }
+
+    // Downloads one random photo at the screen's size (no bigger than 4K), over HTTPS, into a temporary
+    // file that is deleted again, and decodes it. Null if anything goes wrong.
+    private Bitmap downloadPicture(int w, int h) {
+        File tmp = new File(getCacheDir(), "wallpaper.tmp");
+        HttpURLConnection c = null;
+        try {
+            URL url = new URL(PICTURE_URL + Math.min(w, 3840) + "/" + Math.min(h, 2160) + "?random=" + System.nanoTime());
+            c = (HttpURLConnection) url.openConnection();
+            c.setConnectTimeout(8000);
+            c.setReadTimeout(15000);
+            c.setInstanceFollowRedirects(true);
+            if (c.getResponseCode() != 200) return null;
+            try (InputStream in = c.getInputStream(); FileOutputStream out = new FileOutputStream(tmp)) {
+                byte[] buf = new byte[16384];
+                long total = 0;
+                int n;
+                while ((n = in.read(buf)) > 0) {
+                    total += n;
+                    if (total > MAX_DOWNLOAD) return null; // far bigger than a wallpaper should be
+                    out.write(buf, 0, n);
+                }
+            }
+            return decodePicture(tmp, w, h);
+        } catch (Throwable t) {
+            return null;
+        } finally {
+            if (c != null) c.disconnect();
+            tmp.delete();
+        }
     }
 
     // Decodes at the screen's size and fills it, cropping the edges rather than stretching. A 4K
