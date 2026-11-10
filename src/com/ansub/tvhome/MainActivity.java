@@ -151,6 +151,7 @@ public class MainActivity extends Activity {
     private static Typeface regular, semibold;
 
     private FrameLayout root; // the page, inside a vertical scroller
+    private ScrollView pageScroller; // that scroller, to bring the page fully back to the top
     private int tileW, tileH, gridTop; // app grid geometry, set by buildTiles
     private final List<View> tiles = new ArrayList<>();
     private boolean dirty = true;
@@ -199,6 +200,7 @@ public class MainActivity extends Activity {
         scroller.setVerticalScrollBarEnabled(false);
         scroller.setOverScrollMode(View.OVER_SCROLL_NEVER);
         scroller.setClipChildren(false);
+        pageScroller = scroller;
         root = new FrameLayout(this);
         root.setClipChildren(false);
         scroller.addView(root, new FrameLayout.LayoutParams(-1, -2));
@@ -768,7 +770,12 @@ public class MainActivity extends Activity {
         card.setTag(key);
         card.setContentDescription(label);
         card.setOnFocusChangeListener((v, has) -> {
-            if (has) focusedKey = key;
+            if (has) {
+                focusedKey = key;
+                // The page only scrolls far enough to show the icon, which leaves it a little short of
+                // the top. Go all the way, so one press of Up is enough.
+                if (pageScroller != null) pageScroller.smoothScrollTo(0, 0);
+            }
             bg.setColor(has ? 0x38FFFFFF : Color.TRANSPARENT);
             v.animate().scaleX(has ? 1.1f : 1f).scaleY(has ? 1.1f : 1f).setDuration(140).withLayer().start();
         });
