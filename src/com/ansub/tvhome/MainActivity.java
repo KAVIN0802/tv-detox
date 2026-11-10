@@ -11,6 +11,7 @@ import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Typeface;
@@ -19,6 +20,7 @@ import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.LayerDrawable;
+import android.graphics.drawable.TransitionDrawable;
 import android.media.tv.TvContract;
 import android.media.tv.TvInputInfo;
 import android.media.tv.TvInputManager;
@@ -29,6 +31,8 @@ import android.net.NetworkRequest;
 import android.net.Uri;
 import android.net.wifi.WifiManager;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.Settings;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -79,13 +83,9 @@ public class MainActivity extends Activity {
 
     // Settings shortcuts: name, label, icon. Tile keys are QUICK + name.
     private static final String QUICK = "quick:";
-    private static final String[] QUICK_NAMES = {"bluetooth", "sound", "picture", "restart"};
-    private static final String[] QUICK_LABELS = {"Bluetooth", "Sound", "Picture", "Restart"};
-    private static final int[][] QUICK_ICONS = {LineIcon.BLUETOOTH, LineIcon.SOUND, LineIcon.PICTURE, LineIcon.RESTART};
-    // The TV's Settings app listens for this broadcast and restarts the TV. Whether an ordinary app
-    // is allowed to send it depends on the TV, so Restart asks first and may do nothing.
-    private static final String TV_REBOOT_ACTION = "com.android.tv.settings.REBOOT_DEVICE";
-    private static final String TV_SETTINGS_PKG = "com.android.tv.settings";
+    private static final String[] QUICK_NAMES = {"bluetooth", "sound", "picture"};
+    private static final String[] QUICK_LABELS = {"Bluetooth", "Sound", "Picture"};
+    private static final int[][] QUICK_ICONS = {LineIcon.BLUETOOTH, LineIcon.SOUND, LineIcon.PICTURE};
     private static final String NETWORK = "network";
     private static final int OFFLINE = 0, ETHERNET = 4; // network states; 1 to 3 are Wi-Fi bars
     // TCL keeps its own Picture and Sound panels in a service; Android's Sound page is missing there.
@@ -107,7 +107,7 @@ public class MainActivity extends Activity {
     // white labels stay easy to read. Only colours, no images, so every one costs the same as Dusk,
     // the default.
     private static final String[] WALLPAPER_NAMES = {"Dusk", "Midnight", "Plum", "Forest", "Graphite", "Ocean", "Ember",
-            "Sunset", "Lagoon", "Aurora", "Coral", "Iris", "Meadow", "Gold"};
+            "Sunset", "Lagoon", "Aurora", "Coral", "Iris", "Meadow", "Gold", "Pictures"};
     private static final int[][] WALLPAPERS = {
         {0xFF15100F, 0xFF0A0809, 0xFF050405, 0x36FF8048, 0x2EAA3C8C},
         {0xFF0E1220, 0xFF080A13, 0xFF040509, 0x384A6CFF, 0x2E5A3CC8},
@@ -123,7 +123,20 @@ public class MainActivity extends Activity {
         {0xFF5A3CAE, 0xFF3A2A84, 0xFF16123A, 0x90C080FF, 0x804A7CFF},
         {0xFF2E6E4C, 0xFF1C4A40, 0xFF0A201E, 0x90A8E070, 0x6030A8A8},
         {0xFFB07624, 0xFF86401E, 0xFF2A1410, 0x90FFD060, 0x70FF5040},
+        {0xFF0E1220, 0xFF080A13, 0xFF040509, 0x384A6CFF, 0x2E5A3CC8}, // Pictures: shown while one loads
     };
+
+    // The Pictures wallpaper: the images in the launcher's own "wallpapers" folder, one every minute.
+    private static final String PICTURES = "Pictures";
+    private static final long SLIDE_MS = 60 * 1000;
+    private final Handler slideTimer = new Handler(Looper.getMainLooper());
+    private final Runnable slideTick = this::nextSlide;
+    private boolean awake;      // Home is on screen
+    private boolean slides;     // Pictures is the chosen wallpaper
+    private int slideGen;       // bumped to drop a picture that finished loading too late
+    private int slideAt = -1;   // which picture, in name order
+    private int slideFails;     // pictures in a row that could not be read
+    private Bitmap slideBitmap; // the picture on screen, kept so it can be freed
     private float scale = 1f;
 
     private static Typeface regular, semibold;
@@ -221,7 +234,18 @@ public class MainActivity extends Activity {
     }
 
     @Override
+    protected void onStop() {
+        awake = false;
+        if (slides) { // an app is in front: give the picture's memory back
+            getWindow().setBackgroundDrawable(background(WALLPAPERS[WALLPAPERS.length - 1]));
+            releaseSlide();
+        }
+        super.onStop();
+    }
+
+    @Override
     protected void onDestroy() {
+        slideTimer.removeCallbacksAndMessages(null);
         unregisterReceiver(packagesChanged);
         ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
         if (cm != null) try { cm.unregisterNetworkCallback(networkChanged); } catch (Exception ignored) {}
@@ -298,6 +322,8 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        awake = true;
+        if (slides) nextSlide();
         // Rebuild only when apps were installed, removed or updated.
         if (dirty) {
             dirty = false;
@@ -347,11 +373,116 @@ public class MainActivity extends Activity {
     // The saved wallpaper, as an index into WALLPAPERS (Dusk if none is saved).
     private int wallpaper() {
         String saved = getSharedPreferences(PREFS, 0).getString("wallpaper", null);
-        return Math.max(0, Arrays.asList(WALLPAPER_NAMES).indexOf(saved));
+        List<String> names = Arrays.asList(WALLPAPER_NAMES);
+        if (saved == null && pictureFiles().length > 0) return names.indexOf(PICTURES);
+        return Math.max(0, names.indexOf(saved));
     }
 
     private void showWallpaper(int i) {
+        slides = WALLPAPER_NAMES[i].equals(PICTURES);
         getWindow().setBackgroundDrawable(background(WALLPAPERS[i]));
+        releaseSlide(); // after the gradient is on screen, so nothing still draws the old picture
+        if (slides && awake) nextSlide();
+    }
+
+    // The images in the launcher's own folder, in name order. Copy them there with adb push.
+    private File[] pictureFiles() {
+        File dir = getExternalFilesDir("wallpapers");
+        File[] all = dir == null ? null : dir.listFiles();
+        List<File> out = new ArrayList<>();
+        if (all != null) for (File f : all) {
+            String n = f.getName().toLowerCase(java.util.Locale.ROOT);
+            if (f.isFile() && (n.endsWith(".jpg") || n.endsWith(".jpeg") || n.endsWith(".png") || n.endsWith(".webp")))
+                out.add(f);
+        }
+        Collections.sort(out);
+        return out.toArray(new File[0]);
+    }
+
+    // Shows the next picture, then asks again in a minute. No pictures: the gradient stays.
+    private void nextSlide() {
+        slideTimer.removeCallbacks(slideTick);
+        if (!slides || !awake) return;
+        final File[] files = pictureFiles();
+        if (files.length == 0) return;
+        slideAt = (slideAt + 1) % files.length;
+        final File file = files[slideAt];
+        final int gen = ++slideGen;
+        final int w = getResources().getDisplayMetrics().widthPixels;
+        final int h = getResources().getDisplayMetrics().heightPixels;
+        new Thread(() -> {
+            final Bitmap bmp = decodePicture(file, w, h);
+            runOnUiThread(() -> {
+                if (gen != slideGen || !slides || !awake) {
+                    if (bmp != null) bmp.recycle();
+                    return;
+                }
+                if (bmp == null) { // unreadable: try the next one soon, but not in a tight loop
+                    slideTimer.postDelayed(slideTick, ++slideFails >= files.length ? SLIDE_MS : 2000);
+                    return;
+                }
+                slideFails = 0;
+                showPicture(bmp);
+                slideTimer.postDelayed(slideTick, SLIDE_MS);
+            });
+        }, "tvhome-wallpaper").start();
+    }
+
+    // Decodes at the screen's size and fills it, cropping the edges rather than stretching. A 4K
+    // screen gets 16-bit colour: two full 32-bit pictures would take about 66 MB while fading.
+    private Bitmap decodePicture(File f, int w, int h) {
+        try {
+            BitmapFactory.Options o = new BitmapFactory.Options();
+            o.inJustDecodeBounds = true;
+            BitmapFactory.decodeFile(f.getPath(), o);
+            if (o.outWidth <= 0 || o.outHeight <= 0) return null;
+            int sample = 1;
+            while (o.outWidth / (sample * 2) >= w && o.outHeight / (sample * 2) >= h) sample *= 2;
+            o.inJustDecodeBounds = false;
+            o.inSampleSize = sample;
+            o.inPreferredConfig = w > 2560 ? Bitmap.Config.RGB_565 : Bitmap.Config.ARGB_8888;
+            Bitmap src = BitmapFactory.decodeFile(f.getPath(), o);
+            if (src == null) return null;
+            float want = (float) w / h, have = (float) src.getWidth() / src.getHeight();
+            if (Math.abs(want - have) < 0.01f) return src;
+            int cw = have > want ? Math.round(src.getHeight() * want) : src.getWidth();
+            int ch = have > want ? src.getHeight() : Math.round(src.getWidth() / want);
+            Bitmap out = Bitmap.createBitmap(src, (src.getWidth() - cw) / 2, (src.getHeight() - ch) / 2, cw, ch);
+            if (out != src) src.recycle();
+            return out;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    // Fades from what is on screen to the new picture under a light shade, so labels stay readable.
+    private void showPicture(final Bitmap bmp) {
+        GradientDrawable shade = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+                new int[] {0x66000000, 0x33000000, 0xAA000000});
+        final Drawable next = new LayerDrawable(new Drawable[] {new BitmapDrawable(getResources(), bmp), shade});
+        Drawable now = getWindow().getDecorView().getBackground();
+        if (now == null) now = new ColorDrawable(Color.BLACK);
+        final Bitmap old = slideBitmap;
+        slideBitmap = bmp;
+        TransitionDrawable fade = new TransitionDrawable(new Drawable[] {now, next});
+        getWindow().setBackgroundDrawable(fade);
+        fade.startTransition(700);
+        slideTimer.postDelayed(() -> {
+            // After the fade only the new picture is kept, and the old one can be freed.
+            if (slideBitmap == bmp) {
+                getWindow().setBackgroundDrawable(next);
+                if (old != null) old.recycle();
+            }
+        }, 800);
+    }
+
+    // Stops the timer and frees the picture. The caller has already put something else behind the page.
+    private void releaseSlide() {
+        slideTimer.removeCallbacksAndMessages(null);
+        slideGen++;
+        Bitmap b = slideBitmap;
+        slideBitmap = null;
+        if (b != null) b.recycle();
     }
 
     // The wallpapers, each with a small dot of its colours. Moving through the list shows each one
@@ -676,8 +807,7 @@ public class MainActivity extends Activity {
         if (saved == null) return out;
         for (String name : saved.split("[,\\s]+")) {
             int q = Arrays.asList(QUICK_NAMES).indexOf(name.toLowerCase(java.util.Locale.ROOT));
-            if (q < 0 || out.contains(q)) continue;
-            if (!QUICK_NAMES[q].equals("restart") && quickIntents(QUICK_NAMES[q]).isEmpty()) continue;
+            if (q < 0 || out.contains(q) || quickIntents(QUICK_NAMES[q]).isEmpty()) continue;
             out.add(q);
         }
         return out;
@@ -765,10 +895,6 @@ public class MainActivity extends Activity {
 
     // Opens a shortcut's screen: the first one that starts wins. False if none did.
     private boolean openQuick(String name) {
-        if (name.equals("restart")) {
-            confirmRestart();
-            return true;
-        }
         for (Intent i : quickIntents(name)) {
             try {
                 if (TCL_SHOW_WINDOW.equals(i.getAction())) startService(i);
@@ -777,22 +903,6 @@ public class MainActivity extends Activity {
             } catch (Exception ignored) {}
         }
         return false;
-    }
-
-    // Asks first, with Cancel selected, then sends the trigger to the TV's Settings app.
-    private void confirmRestart() {
-        final android.app.AlertDialog d = new android.app.AlertDialog.Builder(this)
-                .setTitle("Restart the TV?")
-                .setNegativeButton("Cancel", null)
-                .setPositiveButton("Restart", (dialog, which) -> {
-                    try {
-                        sendBroadcast(new Intent(TV_REBOOT_ACTION).setPackage(TV_SETTINGS_PKG));
-                    } catch (Exception ignored) {}
-                })
-                .create();
-        d.show();
-        android.widget.Button cancel = d.getButton(android.app.AlertDialog.BUTTON_NEGATIVE);
-        if (cancel != null) cancel.requestFocus();
     }
 
     // The TV's own picture screen, where brightness lives: the Picture shortcut's screens first (TCL's
